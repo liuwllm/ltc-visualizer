@@ -34,16 +34,18 @@ def parse_feed(raw: bytes) -> gtfs.FeedMessage:
     return feed
 
 
-def _empty_feed_like(src: gtfs.FeedMessage) -> gtfs.FeedMessage:
+def _empty_feed_like(source: gtfs.FeedMessage) -> gtfs.FeedMessage:
     """A new feed with the same header and no entities."""
-    out = gtfs.FeedMessage()
-    out.header.gtfs_realtime_version = src.header.gtfs_realtime_version
-    out.header.timestamp = src.header.timestamp
-    return out
+    feed = gtfs.FeedMessage()
+    feed.header.gtfs_realtime_version = source.header.gtfs_realtime_version
+    feed.header.timestamp = source.header.timestamp
+    return feed
 
 
-def _event(stu: gtfs.TripUpdate.StopTimeUpdate) -> gtfs.TripUpdate.StopTimeEvent:
-    return stu.arrival if stu.HasField("arrival") else stu.departure
+def _stop_event(
+    stop_update: gtfs.TripUpdate.StopTimeUpdate,
+) -> gtfs.TripUpdate.StopTimeEvent:
+    return stop_update.arrival if stop_update.HasField("arrival") else stop_update.departure
 
 
 # --------------------------------------------------------------------------- #
@@ -51,7 +53,7 @@ def _event(stu: gtfs.TripUpdate.StopTimeUpdate) -> gtfs.TripUpdate.StopTimeEvent
 # --------------------------------------------------------------------------- #
 
 def _next_stop(
-    tu: gtfs.TripUpdate, now: int, vp_seq: int | None
+    trip_update: gtfs.TripUpdate, now: int, current_stop_sequence: int | None
 ) -> gtfs.TripUpdate.StopTimeUpdate | None:
     """The stop the vehicle is heading to.
 
@@ -60,19 +62,20 @@ def _next_stop(
     timed, non-skipped stop at/after VehiclePositions' current_stop_sequence,
     or, without a position, the first one whose prediction isn't stale.
     """
-    for stu in tu.stop_time_update:
-        if stu.schedule_relationship == SKIPPED or not _event(stu).time:
+    for stop_update in trip_update.stop_time_update:
+        event = _stop_event(stop_update)
+        if stop_update.schedule_relationship == SKIPPED or not event.time:
             continue
-        if vp_seq is not None:
-            if stu.stop_sequence >= vp_seq:
-                return stu
-        elif _event(stu).time >= now - STALE_S:
-            return stu
+        if current_stop_sequence is not None:
+            if stop_update.stop_sequence >= current_stop_sequence:
+                return stop_update
+        elif event.time >= now - STALE_S:
+            return stop_update
     return None
 
 
 def select_current_trips(
-    src: gtfs.FeedMessage, vehicle_trips: VehicleTrips | None = None
+    feed: gtfs.FeedMessage, vehicle_trips: VehicleTrips | None = None
 ) -> dict[str, tuple[gtfs.TripUpdate, gtfs.TripUpdate.StopTimeUpdate]]:
     """Map vehicle id -> (current TripUpdate, its next stop).
 
@@ -80,74 +83,85 @@ def select_current_trips(
     (and sometimes a just-finished one), so the VehiclePositions trip wins;
     without it, the trip with the soonest upcoming stop does.
     """
-    now = src.header.timestamp
+    now = feed.header.timestamp
     vehicle_trips = vehicle_trips or {}
 
     # vehicle id -> (rank, TripUpdate, next stop); lowest rank wins
-    best: dict[str, tuple[tuple, gtfs.TripUpdate, gtfs.TripUpdate.StopTimeUpdate]] = {}
-    for ent in src.entity:
-        if not ent.HasField("trip_update"):
+    best_by_vehicle: dict[
+        str, tuple[tuple, gtfs.TripUpdate, gtfs.TripUpdate.StopTimeUpdate]
+    ] = {}
+    for entity in feed.entity:
+        if not entity.HasField("trip_update"):
             continue
-        tu = ent.trip_update
-        vid = tu.vehicle.id
-        if not vid:
+        trip_update = entity.trip_update
+        vehicle_id = trip_update.vehicle.id
+        if not vehicle_id:
             continue
-        vp_trip, vp_seq = vehicle_trips.get(vid, (None, None))
-        is_vp_trip = tu.trip.trip_id == vp_trip
-        stu = _next_stop(tu, now, vp_seq if is_vp_trip else None)
-        if stu is None:
+        position_trip_id, position_stop_sequence = vehicle_trips.get(
+            vehicle_id, (None, None)
+        )
+        is_position_trip = trip_update.trip.trip_id == position_trip_id
+        next_stop = _next_stop(
+            trip_update, now, position_stop_sequence if is_position_trip else None
+        )
+        if next_stop is None:
             continue
-        rank = (not is_vp_trip, _event(stu).time)
-        if vid not in best or rank < best[vid][0]:
-            best[vid] = (rank, tu, stu)
-    return {vid: (tu, stu) for vid, (_, tu, stu) in best.items()}
+        rank = (not is_position_trip, _stop_event(next_stop).time)
+        if vehicle_id not in best_by_vehicle or rank < best_by_vehicle[vehicle_id][0]:
+            best_by_vehicle[vehicle_id] = (rank, trip_update, next_stop)
+    return {
+        vehicle_id: (trip_update, next_stop)
+        for vehicle_id, (_, trip_update, next_stop) in best_by_vehicle.items()
+    }
 
 
 def _copy_trimmed_trip_update(
-    dst: gtfs.TripUpdate,
-    vid: str,
-    tu: gtfs.TripUpdate,
-    stu: gtfs.TripUpdate.StopTimeUpdate,
+    target: gtfs.TripUpdate,
+    vehicle_id: str,
+    source: gtfs.TripUpdate,
+    next_stop: gtfs.TripUpdate.StopTimeUpdate,
 ) -> None:
-    trip = tu.trip
-    dst.trip.trip_id = trip.trip_id
-    dst.trip.route_id = trip.route_id
-    dst.trip.start_date = trip.start_date
-    dst.trip.start_time = trip.start_time
-    if trip.HasField("direction_id"):
-        dst.trip.direction_id = trip.direction_id
-    if trip.schedule_relationship:
-        dst.trip.schedule_relationship = trip.schedule_relationship
-    dst.vehicle.id = vid
-    if tu.timestamp:
-        dst.timestamp = tu.timestamp
+    source_trip = source.trip
+    target.trip.trip_id = source_trip.trip_id
+    target.trip.route_id = source_trip.route_id
+    target.trip.start_date = source_trip.start_date
+    target.trip.start_time = source_trip.start_time
+    if source_trip.HasField("direction_id"):
+        target.trip.direction_id = source_trip.direction_id
+    if source_trip.schedule_relationship:
+        target.trip.schedule_relationship = source_trip.schedule_relationship
+    target.vehicle.id = vehicle_id
+    if source.timestamp:
+        target.timestamp = source.timestamp
 
     # Next stop only. Scheduled time = time - delay, so it isn't stored.
     # LTC sometimes omits delay; leave it unset rather than store 0, so readers
     # can tell "unknown" apart from "on time" (check HasField("delay")).
-    nxt = dst.stop_time_update.add()
-    nxt.stop_sequence = stu.stop_sequence
-    nxt.stop_id = stu.stop_id
-    ev = _event(stu)
-    dst_ev = nxt.arrival if stu.HasField("arrival") else nxt.departure
-    if ev.HasField("delay"):
-        dst_ev.delay = ev.delay
-    dst_ev.time = ev.time
+    target_stop = target.stop_time_update.add()
+    target_stop.stop_sequence = next_stop.stop_sequence
+    target_stop.stop_id = next_stop.stop_id
+    source_event = _stop_event(next_stop)
+    target_event = (
+        target_stop.arrival if next_stop.HasField("arrival") else target_stop.departure
+    )
+    if source_event.HasField("delay"):
+        target_event.delay = source_event.delay
+    target_event.time = source_event.time
 
 
 def trim_trip_updates(
     raw: bytes, vehicle_trips: VehicleTrips | None = None
 ) -> tuple[gtfs.FeedMessage, int]:
     """Return (trimmed feed, active vehicle count). See select_current_trips."""
-    src = parse_feed(raw)
-    current = select_current_trips(src, vehicle_trips)
+    feed = parse_feed(raw)
+    current_trips = select_current_trips(feed, vehicle_trips)
 
-    out = _empty_feed_like(src)
-    for vid, (tu, stu) in current.items():
-        ent = out.entity.add()
-        ent.id = ""  # required by the proto; the vehicle id carries identity
-        _copy_trimmed_trip_update(ent.trip_update, vid, tu, stu)
-    return out, len(current)
+    trimmed = _empty_feed_like(feed)
+    for vehicle_id, (trip_update, next_stop) in current_trips.items():
+        entity = trimmed.entity.add()
+        entity.id = ""  # required by the proto; the vehicle id carries identity
+        _copy_trimmed_trip_update(entity.trip_update, vehicle_id, trip_update, next_stop)
+    return trimmed, len(current_trips)
 
 
 # --------------------------------------------------------------------------- #
@@ -155,49 +169,49 @@ def trim_trip_updates(
 # --------------------------------------------------------------------------- #
 
 def _copy_trimmed_vehicle_position(
-    dst: gtfs.VehiclePosition, vp: gtfs.VehiclePosition
+    target: gtfs.VehiclePosition, source: gtfs.VehiclePosition
 ) -> None:
-    dst.vehicle.id = vp.vehicle.id
-    if vp.HasField("trip"):
-        dst.trip.trip_id = vp.trip.trip_id
-        dst.trip.route_id = vp.trip.route_id
-        if vp.trip.HasField("direction_id"):
-            dst.trip.direction_id = vp.trip.direction_id
-    dst.position.latitude = vp.position.latitude
-    dst.position.longitude = vp.position.longitude
-    if vp.position.HasField("bearing"):
-        dst.position.bearing = vp.position.bearing
-    if vp.position.HasField("speed"):
-        dst.position.speed = vp.position.speed
-    if vp.HasField("current_stop_sequence"):
-        dst.current_stop_sequence = vp.current_stop_sequence
-    if vp.HasField("current_status"):
-        dst.current_status = vp.current_status
-    if vp.timestamp:
-        dst.timestamp = vp.timestamp
+    target.vehicle.id = source.vehicle.id
+    if source.HasField("trip"):
+        target.trip.trip_id = source.trip.trip_id
+        target.trip.route_id = source.trip.route_id
+        if source.trip.HasField("direction_id"):
+            target.trip.direction_id = source.trip.direction_id
+    target.position.latitude = source.position.latitude
+    target.position.longitude = source.position.longitude
+    if source.position.HasField("bearing"):
+        target.position.bearing = source.position.bearing
+    if source.position.HasField("speed"):
+        target.position.speed = source.position.speed
+    if source.HasField("current_stop_sequence"):
+        target.current_stop_sequence = source.current_stop_sequence
+    if source.HasField("current_status"):
+        target.current_status = source.current_status
+    if source.timestamp:
+        target.timestamp = source.timestamp
 
 
 def trim_vehicle_positions(raw: bytes) -> gtfs.FeedMessage:
     """Keep only vehicles with a position, and only the fields we use."""
-    src = parse_feed(raw)
-    out = _empty_feed_like(src)
-    for ent in src.entity:
-        if not ent.HasField("vehicle") or not ent.vehicle.HasField("position"):
+    feed = parse_feed(raw)
+    trimmed = _empty_feed_like(feed)
+    for entity in feed.entity:
+        if not entity.HasField("vehicle") or not entity.vehicle.HasField("position"):
             continue
-        dst = out.entity.add()
-        dst.id = ""
-        _copy_trimmed_vehicle_position(dst.vehicle, ent.vehicle)
-    return out
+        trimmed_entity = trimmed.entity.add()
+        trimmed_entity.id = ""
+        _copy_trimmed_vehicle_position(trimmed_entity.vehicle, entity.vehicle)
+    return trimmed
 
 
-def vehicle_trips(vp: gtfs.FeedMessage) -> VehicleTrips:
+def vehicle_trips(vehicle_positions: gtfs.FeedMessage) -> VehicleTrips:
     """Map vehicle id -> (trip id, current stop sequence) for trim_trip_updates."""
     return {
-        e.vehicle.vehicle.id: (
-            e.vehicle.trip.trip_id,
-            e.vehicle.current_stop_sequence
-            if e.vehicle.HasField("current_stop_sequence")
+        entity.vehicle.vehicle.id: (
+            entity.vehicle.trip.trip_id,
+            entity.vehicle.current_stop_sequence
+            if entity.vehicle.HasField("current_stop_sequence")
             else None,
         )
-        for e in vp.entity
+        for entity in vehicle_positions.entity
     }

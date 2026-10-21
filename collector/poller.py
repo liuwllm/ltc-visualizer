@@ -48,60 +48,68 @@ log = logging.getLogger("ltc-poller")
 # --------------------------------------------------------------------------- #
 
 class Poller:
-    def __init__(self, coll: Collection):
-        self.coll = coll
-        self.http = requests.Session()
-        self.tu_etag: str | None = None
-        self.last_ts: datetime | None = db.latest_ts(coll)
+    def __init__(self, collection: Collection):
+        self.collection = collection
+        self.session = requests.Session()
+        self.trip_updates_etag: str | None = None
+        self.last_stored_time: datetime | None = db.latest_ts(collection)
 
     def _get(self, url: str, etag: str | None = None) -> requests.Response:
         headers = {"If-None-Match": etag} if etag else {}
-        resp = self.http.get(url, headers=headers, timeout=HTTP_TIMEOUT_S)
-        if resp.status_code != 304:
-            resp.raise_for_status()
-        return resp
+        response = self.session.get(url, headers=headers, timeout=HTTP_TIMEOUT_S)
+        if response.status_code != 304:
+            response.raise_for_status()
+        return response
 
     def _fetch_vehicle_positions(self) -> gtfs.FeedMessage | None:
         if not STORE_VEHICLE_POSITIONS:
             return None
         try:
             return feeds.trim_vehicle_positions(self._get(VEHICLE_POSITIONS_URL).content)
-        except Exception as e:
+        except Exception as error:
             # Still worth storing the trip updates on their own.
-            log.warning("VehiclePositions fetch failed: %s", e)
+            log.warning("VehiclePositions fetch failed: %s", error)
             return None
 
-    def _is_stored(self, ts: datetime) -> bool:
-        return self.last_ts is not None and ts <= self.last_ts
+    def _is_stored(self, feed_time: datetime) -> bool:
+        return self.last_stored_time is not None and feed_time <= self.last_stored_time
 
     def poll_once(self) -> None:
-        resp = self._get(TRIP_UPDATES_URL, self.tu_etag)
-        if resp.status_code == 304:
+        response = self._get(TRIP_UPDATES_URL, self.trip_updates_etag)
+        if response.status_code == 304:
             log.info("TripUpdates unchanged since last poll; skipping")
             return
         # Only remember the ETag once the snapshot is safely stored, so a
         # failed insert (e.g. Mongo restarting) is retried next poll, not 304'd.
-        etag = resp.headers.get("ETag")
+        etag = response.headers.get("ETag")
 
-        vp = self._fetch_vehicle_positions()
-        trips = feeds.vehicle_trips(vp) if vp is not None else None
-        tu, n_active = feeds.trim_trip_updates(resp.content, trips)
+        vehicle_positions = self._fetch_vehicle_positions()
+        vehicle_trips = (
+            feeds.vehicle_trips(vehicle_positions)
+            if vehicle_positions is not None
+            else None
+        )
+        trip_updates, active_vehicle_count = feeds.trim_trip_updates(
+            response.content, vehicle_trips
+        )
 
-        ts = datetime.fromtimestamp(tu.header.timestamp, tz=timezone.utc)
-        if self._is_stored(ts):
-            self.tu_etag = etag
-            log.info("Feed timestamp %s already stored; skipping", ts.isoformat())
+        feed_time = datetime.fromtimestamp(trip_updates.header.timestamp, tz=timezone.utc)
+        if self._is_stored(feed_time):
+            self.trip_updates_etag = etag
+            log.info("Feed timestamp %s already stored; skipping", feed_time.isoformat())
             return
 
-        doc = db.make_snapshot(ts, n_active, tu, vp)
-        if not db.insert_snapshot(self.coll, doc):
-            log.info("Snapshot %s already stored", ts.isoformat())
-        self.tu_etag = etag
-        self.last_ts = ts
+        snapshot = db.make_snapshot(
+            feed_time, active_vehicle_count, trip_updates, vehicle_positions
+        )
+        if not db.insert_snapshot(self.collection, snapshot):
+            log.info("Snapshot %s already stored", feed_time.isoformat())
+        self.trip_updates_etag = etag
+        self.last_stored_time = feed_time
         log.info(
             "stored %s: %d vehicles, tu=%d B (raw %d B), vp=%s B",
-            ts.isoformat(), n_active, len(doc["tu"]), len(resp.content),
-            len(doc["vp"]) if "vp" in doc else "-",
+            feed_time.isoformat(), active_vehicle_count, len(snapshot["tu"]),
+            len(response.content), len(snapshot["vp"]) if "vp" in snapshot else "-",
         )
 
 
@@ -136,92 +144,94 @@ def connect_with_retry(client, shutdown: Shutdown) -> Poller | None:
     pymongo reconnects on its own once connected; this only covers startup,
     e.g. Mongo still coming up or temporarily down.
     """
-    backoff = 1
+    retry_delay_s = 1
     while True:
         try:
             return Poller(db.open_collection(client))
-        except PyMongoError as e:
-            log.warning("MongoDB unavailable (%s); retrying in %ds", e, backoff)
-            shutdown.sleep(backoff)
+        except PyMongoError as error:
+            log.warning("MongoDB unavailable (%s); retrying in %ds", error, retry_delay_s)
+            shutdown.sleep(retry_delay_s)
             if shutdown.stopping:
                 return None
-            backoff = min(backoff * 2, 60)
+            retry_delay_s = min(retry_delay_s * 2, 60)
 
 
-def retry_after_s(e: requests.RequestException) -> float | None:
+def retry_after_s(error: requests.RequestException) -> float | None:
     """Seconds to wait from the response's Retry-After header, if any."""
-    value = e.response.headers.get("Retry-After") if e.response is not None else None
-    if value is None:
+    header = (
+        error.response.headers.get("Retry-After") if error.response is not None else None
+    )
+    if header is None:
         return None
     try:
-        return max(0.0, float(value))
+        return max(0.0, float(header))
     except ValueError:
         pass
     try:  # HTTP-date form
-        when = email.utils.parsedate_to_datetime(value)
+        retry_at = email.utils.parsedate_to_datetime(header)
     except (TypeError, ValueError):
         return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
 
 
-def backoff_s(failures: int, e: requests.RequestException) -> float:
-    delay = min(POLL_INTERVAL_S * 2 ** (failures - 1), MAX_BACKOFF_S)
-    retry_after = retry_after_s(e)
-    if retry_after is not None:
-        delay = max(delay, min(retry_after, MAX_RETRY_AFTER_S))
-    return delay
+def backoff_s(consecutive_failures: int, error: requests.RequestException) -> float:
+    delay_s = min(POLL_INTERVAL_S * 2 ** (consecutive_failures - 1), MAX_BACKOFF_S)
+    requested_delay_s = retry_after_s(error)
+    if requested_delay_s is not None:
+        delay_s = max(delay_s, min(requested_delay_s, MAX_RETRY_AFTER_S))
+    return delay_s
 
 
 def poll_safely(poller: Poller) -> requests.RequestException | None:
     """Poll once; returns the error if the LTC request failed, else None."""
     try:
         poller.poll_once()
-    except requests.RequestException as e:  # rate limited, LTC down, network
-        return e
-    except PyMongoError as e:  # Mongo restarting; pymongo reconnects
-        log.warning("Poll failed, MongoDB unavailable: %s", e)
+    except requests.RequestException as error:  # rate limited, LTC down, network
+        return error
+    except PyMongoError as error:  # Mongo restarting; pymongo reconnects
+        log.warning("Poll failed, MongoDB unavailable: %s", error)
     except Exception:  # keep polling through feed hiccups
         log.exception("Poll failed")
     return None
 
 
-def log_storage_safely(coll: Collection) -> None:
+def log_storage_safely(collection: Collection) -> None:
     try:
-        db.log_storage(coll, POLL_INTERVAL_S)
+        db.log_storage(collection, POLL_INTERVAL_S)
     except Exception:
         log.exception("Storage stats failed")
 
 
 def run(poller: Poller, shutdown: Shutdown) -> None:
-    next_tick = time.monotonic()
-    next_stats = time.monotonic()
-    failures = 0
+    next_poll_at = time.monotonic()
+    next_stats_at = time.monotonic()
+    consecutive_failures = 0
     while not shutdown.stopping:
-        err = poll_safely(poller)
-        if time.monotonic() >= next_stats:
-            log_storage_safely(poller.coll)
-            next_stats += STATS_INTERVAL_S
+        request_error = poll_safely(poller)
+        if time.monotonic() >= next_stats_at:
+            log_storage_safely(poller.collection)
+            next_stats_at += STATS_INTERVAL_S
 
-        if err is not None:
-            failures += 1
-            delay = backoff_s(failures, err)
+        if request_error is not None:
+            consecutive_failures += 1
+            delay_s = backoff_s(consecutive_failures, request_error)
             log.warning(
                 "LTC feed request failed (%d in a row): %s; retrying in %ds",
-                failures, err, delay,
+                consecutive_failures, request_error, delay_s,
             )
-            shutdown.sleep(delay)
-            next_tick = time.monotonic()  # resume the normal schedule from here
+            shutdown.sleep(delay_s)
+            next_poll_at = time.monotonic()  # resume the normal schedule from here
             continue
-        if failures:
-            log.info("LTC feed recovered after %d failed polls", failures)
-            failures = 0
+        if consecutive_failures:
+            log.info("LTC feed recovered after %d failed polls", consecutive_failures)
+            consecutive_failures = 0
 
-        next_tick += POLL_INTERVAL_S
-        shutdown.sleep(next_tick - time.monotonic())
-        if time.monotonic() - next_tick > POLL_INTERVAL_S:
-            next_tick = time.monotonic()  # fell far behind; don't burst-poll
+        next_poll_at += POLL_INTERVAL_S
+        shutdown.sleep(next_poll_at - time.monotonic())
+        if time.monotonic() - next_poll_at > POLL_INTERVAL_S:
+            next_poll_at = time.monotonic()  # fell far behind; don't burst-poll
 
 
 def main() -> None:
