@@ -20,7 +20,7 @@ One document per poll in `ltc.snapshots`:
 |-------|--------|----------------------------------------------------------|
 | `ts`  | Date   | TripUpdates feed timestamp; unique index **with TTL**    |
 | `n`   | int    | vehicles assigned to a trip (see notes below)            |
-| `tu`  | Binary | trimmed TripUpdates protobuf: current trip per vehicle, next-stop delay only |
+| `tu`  | Binary | trimmed TripUpdates protobuf: current trip per vehicle, next stop's arrival and departure delay/time only |
 | `vp`  | Binary | trimmed VehiclePositions protobuf: lat/lon/bearing/speed per vehicle |
 
 Decode the blobs with `db.decode_snapshot(snapshot)` (in `collector/`).
@@ -32,12 +32,16 @@ Notes for building metrics from `tu`:
   `HasField("delay")` before using it and treat the rest as unknown. Reading
   `.delay` directly returns 0 for those. Snapshots stored before this fix
   have them as 0 and can't be told apart.
+- **Use the departure delay for on-time %.** At timing points a bus can
+  arrive late but leave on schedule (e.g. +452 s arrival vs +92 s departure),
+  so arrival delay overstates lateness. Snapshots stored before this change
+  have only the arrival.
 - **`tu` / `n` include buses waiting to start a trip** (e.g. at a terminal
   between trips), not just buses mid-route: ~13% in a sample. Exclude them for
   bunching; they're the ones whose next stop is the trip's first stop.
 
-A raw TripUpdates response is ~3.1 MB. After trimming, a poll is ~25 KB
-(~14 KB TU + ~10 KB VP) before Mongo's zstd compression, or roughly **1 GB per
+A raw TripUpdates response is ~3.1 MB. After trimming, a poll is ~27 KB
+(~17 KB TU + ~10 KB VP) before Mongo's zstd compression, or roughly **1 GB per
 month**. VehiclePositions is also polled because TripUpdates has no
 location or speed, which you need for average speed and bunching. Set
 `STORE_VEHICLE_POSITIONS=0` to skip it.

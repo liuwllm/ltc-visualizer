@@ -134,19 +134,23 @@ def _copy_trimmed_trip_update(
     if source.timestamp:
         target.timestamp = source.timestamp
 
-    # Next stop only. Scheduled time = time - delay, so it isn't stored.
+    # Next stop only, with both arrival and departure: at timing points a bus
+    # can arrive late but leave on time, and on-time is usually measured on
+    # departure. Scheduled time = time - delay, so it isn't stored.
     # LTC sometimes omits delay; leave it unset rather than store 0, so readers
     # can tell "unknown" apart from "on time" (check HasField("delay")).
     target_stop = target.stop_time_update.add()
     target_stop.stop_sequence = next_stop.stop_sequence
     target_stop.stop_id = next_stop.stop_id
-    source_event = _stop_event(next_stop)
-    target_event = (
-        target_stop.arrival if next_stop.HasField("arrival") else target_stop.departure
-    )
-    if source_event.HasField("delay"):
-        target_event.delay = source_event.delay
-    target_event.time = source_event.time
+    for event_name in ("arrival", "departure"):
+        if not next_stop.HasField(event_name):
+            continue
+        source_event = getattr(next_stop, event_name)
+        target_event = getattr(target_stop, event_name)
+        if source_event.HasField("delay"):
+            target_event.delay = source_event.delay
+        if source_event.HasField("time"):
+            target_event.time = source_event.time
 
 
 def trim_trip_updates(
