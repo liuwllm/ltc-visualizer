@@ -38,7 +38,9 @@ Notes for building metrics from `tu`:
   have only the arrival.
 - **`tu` / `n` include buses waiting to start a trip** (e.g. at a terminal
   between trips), not just buses mid-route: ~13% in a sample. Exclude them for
-  bunching; they're the ones whose next stop is the trip's first stop.
+  bunching with `static_gtfs.is_before_first_stop(trip, stop_sequence)`.
+- **Direction and route shape come from the static GTFS** (below): LTC's
+  realtime feed only has `direction_id` for about a third of trips.
 
 A raw TripUpdates response is ~3.1 MB. After trimming, a poll is ~27 KB
 (~17 KB TU + ~10 KB VP) before Mongo's zstd compression, or roughly **1 GB per
@@ -59,6 +61,33 @@ location or speed, which you need for average speed and bunching. Set
 - **MongoDB** is retried with backoff (1 s up to 60 s) at startup; after that,
   a failed insert is retried on the next poll.
 
+## Static GTFS
+
+The poller also checks LTC's static GTFS zip once a day (an hour after a
+failed check), with `If-None-Match` / `If-Modified-Since` so an unchanged file
+isn't downloaded. It's stored in the same database (`collector/static_gtfs.py`
+documents the collections):
+
+- **Versions are identified by their contents**: a hash of every file in the
+  zip, not `feed_version` or the ETag. Any changed file is a new version; a
+  re-uploaded identical zip isn't.
+- **Each version is kept** (its original zip, plus trips, shapes, stops and
+  routes for lookups) until its end date is more than `RETENTION_DAYS` ago,
+  so every retained snapshot can still be matched. The version LTC currently
+  serves is never deleted.
+- **Pick the version by the trip's service date**, not "latest": LTC
+  publishes versions a few days before they take effect.
+
+Lookups (each takes the Mongo `Database`):
+
+| function | returns |
+|----------|---------|
+| `resolve_trips(database, service_date, trip_ids)` | static info for realtime trips (direction, shape, block, first/last stop sequence, `version`), using the version in effect on `service_date` (the TripUpdates `start_date`) |
+| `is_before_first_stop(trip, stop_sequence)` | whether a bus hasn't started its trip yet |
+| `version_for_date` / `versions_for_date` / `latest_version` | version ids / records |
+| `get_trips` / `get_shapes` / `get_stops` / `get_routes(database, version, ids=None)` | id -> record for one version; shapes include cumulative `dist_m` along the route |
+| `read_table(database, version, "stop_times.txt")` | rows of any file in that version's zip |
+
 ## Configuration (env vars)
 
 | var | default |
@@ -69,3 +98,4 @@ location or speed, which you need for average speed and bunching. Set
 | `RETENTION_DAYS` | `35`. **TODO:** raise once real storage numbers are in; restarting the poller updates the TTL in place |
 | `STORAGE_BUDGET_GB` | `12`, used only for the hourly storage projection in the logs |
 | `STORE_VEHICLE_POSITIONS` | `1` |
+| `STATIC_GTFS_URL` | `https://www.londontransit.ca/gtfsfeed/google_transit.zip` |

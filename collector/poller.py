@@ -2,6 +2,7 @@
 
 Trimming lives in feeds.py and storage in db.py; this module fetches the feeds
 and runs the loop. Set STORE_VEHICLE_POSITIONS=0 to skip VehiclePositions.
+The static GTFS is checked daily too (static_gtfs.py).
 
 Run:  python collector/poller.py
 """
@@ -22,6 +23,7 @@ from pymongo.errors import PyMongoError
 
 import db
 import feeds
+import static_gtfs
 
 TRIP_UPDATES_URL = os.getenv(
     "TRIP_UPDATES_URL", "http://gtfs.ltconline.ca/TripUpdate/TripUpdates.pb"
@@ -39,6 +41,8 @@ HTTP_TIMEOUT_S = 20
 MAX_BACKOFF_S = 600
 MAX_RETRY_AFTER_S = 3600
 STATS_INTERVAL_S = 3600
+STATIC_GTFS_CHECK_INTERVAL_S = 86400
+STATIC_GTFS_RETRY_S = 3600  # after a failed check
 
 log = logging.getLogger("ltc-poller")
 
@@ -204,15 +208,33 @@ def log_storage_safely(collection: Collection) -> None:
         log.exception("Storage stats failed")
 
 
+def update_static_gtfs_safely(poller: Poller) -> bool:
+    """Import a new static GTFS version if there is one and expire old ones."""
+    database = poller.collection.database
+    try:
+        static_gtfs.check_for_update(database, poller.session)
+        static_gtfs.delete_expired_versions(database)
+    except Exception:
+        log.exception("Static GTFS update failed")
+        return False
+    return True
+
+
 def run(poller: Poller, shutdown: Shutdown) -> None:
     next_poll_at = time.monotonic()
     next_stats_at = time.monotonic()
+    next_static_check_at = time.monotonic()
     consecutive_failures = 0
     while not shutdown.stopping:
         request_error = poll_safely(poller)
         if time.monotonic() >= next_stats_at:
             log_storage_safely(poller.collection)
             next_stats_at += STATS_INTERVAL_S
+        if time.monotonic() >= next_static_check_at:
+            succeeded = update_static_gtfs_safely(poller)
+            next_static_check_at = time.monotonic() + (
+                STATIC_GTFS_CHECK_INTERVAL_S if succeeded else STATIC_GTFS_RETRY_S
+            )
 
         if request_error is not None:
             consecutive_failures += 1
