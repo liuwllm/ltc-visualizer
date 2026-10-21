@@ -1,0 +1,43 @@
+services:
+  mongo:
+    image: mongo:8.0
+    container_name: ltc-mongo
+    restart: unless-stopped
+    command:
+      - --bind_ip_all
+      # Keep the footprint small: a tiny cache, and zstd (better ratio than
+      # the default snappy) for collection data and the journal.
+      - --wiredTigerCacheSizeGB=0.25
+      - --wiredTigerCollectionBlockCompressor=zstd
+      - --wiredTigerJournalCompressor=zstd
+    ports:
+      # Only reachable from this machine; there is no auth configured.
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  poller:
+    build: .
+    container_name: ltc-poller
+    restart: unless-stopped
+    environment:
+      # Set in .env (see .env.example). Uses the service name, not localhost.
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  mongo-data:
