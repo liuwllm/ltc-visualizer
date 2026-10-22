@@ -7,9 +7,10 @@ on-time/early/late %).
 ## Run
 
 ```bash
-docker compose up -d                 # MongoDB on 127.0.0.1:27017 (no auth, localhost only)
-python -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python collector/poller.py # polls each feed every 60s; Ctrl-C to stop
+docker compose up -d            # MongoDB on 127.0.0.1:27017 (no auth, localhost only) + poller
+docker compose up -d --build    # rebuild after code changes
+docker compose logs -f poller   # follow poller logs
+docker compose down             # stop (Mongo data is kept in the volume)
 ```
 
 ## What gets stored
@@ -113,7 +114,7 @@ Lookups (each takes the Mongo `Database`):
 
 | var | default |
 |-----|---------|
-| `MONGO_URI` | `mongodb://localhost:27017` |
+| `MONGO_URI` | `mongodb://mongo:27017` (set in `docker-compose.yml`) |
 | `MONGO_DB` | `ltc` |
 | `TRIP_UPDATES_COLLECTION` | `snapshots` (`MONGO_COLLECTION` still works as the old name) |
 | `VEHICLE_POSITIONS_COLLECTION` | `vehicle_positions` |
