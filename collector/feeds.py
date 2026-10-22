@@ -52,6 +52,16 @@ def _stop_event(
 # TripUpdates
 # --------------------------------------------------------------------------- #
 
+def _has_left(stop_update: gtfs.TripUpdate.StopTimeUpdate, now: int) -> bool:
+    """True if the bus left this stop more than STALE_S ago.
+
+    Uses the departure time, so a bus holding at a timing point (arrived long
+    ago, leaving soon) is still at that stop.
+    """
+    leaves = stop_update.departure if stop_update.departure.time else _stop_event(stop_update)
+    return leaves.time < now - STALE_S
+
+
 def _next_stop(
     trip_update: gtfs.TripUpdate, now: int, current_stop_sequence: int | None
 ) -> gtfs.TripUpdate.StopTimeUpdate | None:
@@ -59,18 +69,19 @@ def _next_stop(
 
     LTC's feed can keep stops the bus already passed at the front of the list,
     and detoured stops come through as SKIPPED with no times. So: the first
-    timed, non-skipped stop at/after VehiclePositions' current_stop_sequence,
-    or, without a position, the first one whose prediction isn't stale.
+    timed, non-skipped stop the bus hasn't left, and not before
+    VehiclePositions' current_stop_sequence when we have a reliable one. The
+    VehiclePositions fetch can be up to a poll older than this feed, so its
+    sequence is only a lower bound.
     """
     for stop_update in trip_update.stop_time_update:
-        event = _stop_event(stop_update)
-        if stop_update.schedule_relationship == SKIPPED or not event.time:
+        if stop_update.schedule_relationship == SKIPPED or not _stop_event(stop_update).time:
             continue
-        if current_stop_sequence is not None:
-            if stop_update.stop_sequence >= current_stop_sequence:
-                return stop_update
-        elif event.time >= now - STALE_S:
-            return stop_update
+        if current_stop_sequence is not None and stop_update.stop_sequence < current_stop_sequence:
+            continue
+        if _has_left(stop_update, now):
+            continue
+        return stop_update
     return None
 
 
@@ -209,12 +220,18 @@ def trim_vehicle_positions(raw: bytes) -> gtfs.FeedMessage:
 
 
 def vehicle_trips(vehicle_positions: gtfs.FeedMessage) -> VehicleTrips:
-    """Map vehicle id -> (trip id, current stop sequence) for trim_trip_updates."""
+    """Map vehicle id -> (trip id, current stop sequence) for trim_trip_updates.
+
+    The stop sequence is only used when LTC also sends current_status: without
+    it (most vehicles), current_stop_sequence is often several stops ahead of
+    the bus, sometimes past the trip's last stop.
+    """
     return {
         entity.vehicle.vehicle.id: (
             entity.vehicle.trip.trip_id,
             entity.vehicle.current_stop_sequence
             if entity.vehicle.HasField("current_stop_sequence")
+            and entity.vehicle.HasField("current_status")
             else None,
         )
         for entity in vehicle_positions.entity

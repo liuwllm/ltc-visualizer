@@ -1,17 +1,26 @@
 """MongoDB storage for trimmed feed snapshots.
 
-Storage model: one document per poll.
+Storage model: one document per new feed version, one collection per feed,
+since each feed is polled on its own.
 
+    trip updates collection ("snapshots"):
     {
-      ts:  Date     # feed header timestamp of TripUpdates (indexed, TTL)
-      n:   int      # number of active vehicles in this snapshot
+      ts:  Date     # feed header timestamp (indexed, TTL)
+      n:   int      # vehicles assigned to a trip
       tu:  Binary   # trimmed TripUpdates FeedMessage (protobuf)
-      vp:  Binary   # trimmed VehiclePositions FeedMessage (protobuf), optional
     }
 
-Only `ts` needs to be queried/indexed, so everything else stays as compact
-protobuf bytes; decode it with `decode_snapshot()` when building dashboard
-metrics.
+    vehicle positions collection ("vehicle_positions"):
+    {
+      ts:  Date     # feed header timestamp (indexed, TTL)
+      n:   int      # vehicles with a position
+      vp:  Binary   # trimmed VehiclePositions FeedMessage (protobuf)
+    }
+
+Snapshots stored before the feeds were split also have `vp` in the trip
+updates collection. Only `ts` needs to be queried/indexed, so everything else
+stays as compact protobuf bytes; decode it with `decode_snapshot()` when
+building dashboard metrics.
 """
 
 from __future__ import annotations
@@ -31,7 +40,13 @@ from feeds import parse_feed
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "ltc")
-MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "snapshots")
+# MONGO_COLLECTION is the older name for TRIP_UPDATES_COLLECTION.
+TRIP_UPDATES_COLLECTION = os.getenv(
+    "TRIP_UPDATES_COLLECTION", os.getenv("MONGO_COLLECTION", "snapshots")
+)
+VEHICLE_POSITIONS_COLLECTION = os.getenv(
+    "VEHICLE_POSITIONS_COLLECTION", "vehicle_positions"
+)
 
 # TODO: Tune once real usage is known. The poller logs measured storage and a
 # projection for this retention every hour; raise this if the projection is
@@ -54,9 +69,9 @@ def connect(uri: str = MONGO_URI) -> MongoClient:
     return MongoClient(uri, serverSelectionTimeoutMS=10_000)
 
 
-def ensure_collection(database: Database) -> Collection:
-    """Return the snapshots collection, creating or updating its TTL index."""
-    collection = database[MONGO_COLLECTION]
+def ensure_collection(database: Database, name: str) -> Collection:
+    """Return a snapshots collection, creating or updating its TTL index."""
+    collection = database[name]
     ttl_s = RETENTION_DAYS * 86400
     try:
         collection.create_index(
@@ -71,15 +86,20 @@ def ensure_collection(database: Database) -> Collection:
             raise
         database.command(
             "collMod",
-            MONGO_COLLECTION,
+            name,
             index={"name": TTL_INDEX_NAME, "expireAfterSeconds": ttl_s},
         )
-        log.info("Updated TTL index to %d days", RETENTION_DAYS)
+        log.info("Updated %s TTL index to %d days", name, RETENTION_DAYS)
     return collection
 
 
-def open_collection(client: MongoClient) -> Collection:
-    return ensure_collection(client[MONGO_DB])
+def open_collections(client: MongoClient) -> tuple[Collection, Collection]:
+    """Return the (trip updates, vehicle positions) collections."""
+    database = client[MONGO_DB]
+    return (
+        ensure_collection(database, TRIP_UPDATES_COLLECTION),
+        ensure_collection(database, VEHICLE_POSITIONS_COLLECTION),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -87,24 +107,20 @@ def open_collection(client: MongoClient) -> Collection:
 # --------------------------------------------------------------------------- #
 
 def make_snapshot(
-    feed_time: datetime,
-    active_vehicle_count: int,
-    trip_updates: gtfs.FeedMessage,
-    vehicle_positions: gtfs.FeedMessage | None = None,
+    feed_time: datetime, vehicle_count: int, field: str, feed: gtfs.FeedMessage
 ) -> dict:
-    snapshot = {
-        "ts": feed_time,
-        "n": active_vehicle_count,
-        "tu": Binary(trip_updates.SerializeToString()),
-    }
-    if vehicle_positions is not None:
-        snapshot["vp"] = Binary(vehicle_positions.SerializeToString())
-    return snapshot
+    """A document storing `feed` under `field` ("tu" or "vp")."""
+    return {"ts": feed_time, "n": vehicle_count, field: Binary(feed.SerializeToString())}
 
 
-def decode_snapshot(snapshot: dict) -> tuple[gtfs.FeedMessage, gtfs.FeedMessage | None]:
-    """Turn a stored document back into (trip_updates, vehicle_positions)."""
-    trip_updates = parse_feed(snapshot["tu"])
+def decode_snapshot(
+    snapshot: dict,
+) -> tuple[gtfs.FeedMessage | None, gtfs.FeedMessage | None]:
+    """Turn a stored document back into (trip_updates, vehicle_positions).
+
+    Each is None if the document doesn't hold that feed.
+    """
+    trip_updates = parse_feed(snapshot["tu"]) if snapshot.get("tu") is not None else None
     vehicle_positions = (
         parse_feed(snapshot["vp"]) if snapshot.get("vp") is not None else None
     )
@@ -143,19 +159,32 @@ def storage_stats(collection: Collection) -> tuple[int, int]:
     return doc_count, bytes_on_disk
 
 
-def log_storage(collection: Collection, poll_interval_s: int) -> None:
-    doc_count, bytes_on_disk = storage_stats(collection)
-    if not doc_count:
+def log_storage(collections: list[tuple[Collection, int]]) -> None:
+    """Log storage per (collection, poll interval) and the combined projection.
+
+    Assumes one document per poll, so feeds that often don't change between
+    polls come out pessimistic.
+    """
+    bytes_per_day = 0.0
+    for collection, poll_interval_s in collections:
+        doc_count, bytes_on_disk = storage_stats(collection)
+        if not doc_count:
+            continue
+        bytes_per_doc = bytes_on_disk / doc_count
+        collection_bytes_per_day = bytes_per_doc * 86400 / poll_interval_s
+        bytes_per_day += collection_bytes_per_day
+        log.info(
+            "storage %s: %d docs, %.1f MB on disk (%.1f KB/doc) -> ~%.2f GB "
+            "for %d-day retention",
+            collection.name, doc_count, bytes_on_disk / 1e6, bytes_per_doc / 1e3,
+            collection_bytes_per_day * RETENTION_DAYS / 1e9, RETENTION_DAYS,
+        )
+    if not bytes_per_day:
         return
-    bytes_per_doc = bytes_on_disk / doc_count
-    polls_per_day = 86400 / poll_interval_s
-    projected_gb = bytes_per_doc * polls_per_day * RETENTION_DAYS / 1e9
-    days_within_budget = STORAGE_BUDGET_GB * 1e9 / (bytes_per_doc * polls_per_day)
     log.info(
-        "storage: %d docs, %.1f MB on disk (%.1f KB/doc). %d-day retention "
-        "-> ~%.2f GB; %.0f GB budget fits ~%.0f days",
-        doc_count, bytes_on_disk / 1e6, bytes_per_doc / 1e3, RETENTION_DAYS,
-        projected_gb, STORAGE_BUDGET_GB, days_within_budget,
+        "storage total: %d-day retention -> ~%.2f GB; %.0f GB budget fits ~%.0f days",
+        RETENTION_DAYS, bytes_per_day * RETENTION_DAYS / 1e9,
+        STORAGE_BUDGET_GB, STORAGE_BUDGET_GB * 1e9 / bytes_per_day,
     )
     # Small collections are dominated by fixed overhead, so treat early
     # projections as pessimistic.
