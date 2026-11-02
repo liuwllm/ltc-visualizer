@@ -8,6 +8,7 @@ on-time/early/late %).
 
 ```bash
 docker compose up -d            # MongoDB on 127.0.0.1:27017 (no auth, localhost only) + poller
+                                # + backend (Express) on 127.0.0.1:3000; GET /health pings Mongo
 docker compose up -d --build    # rebuild after code changes
 docker compose logs -f poller   # follow poller logs
 docker compose down             # stop (Mongo data is kept in the volume)

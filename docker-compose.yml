@@ -39,5 +39,23 @@ services:
         max-size: 10m
         max-file: "3"
 
+  backend:
+    build: ./backend
+    container_name: ltc-backend
+    restart: unless-stopped
+    environment:
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
+    ports:
+      # Only reachable from this machine, like Mongo.
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
 volumes:
   mongo-data:
