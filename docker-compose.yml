@@ -12,7 +12,7 @@ services:
       - --wiredTigerJournalCompressor=zstd
     ports:
       # Only reachable from this machine; there is no auth configured.
-      - "127.0.0.1:27017:27017"
+      - "127.0.0.1:${MONGO_PORT:-27017}:27017"
     volumes:
       - mongo-data:/data/db
     mem_limit: 768m
@@ -47,7 +47,7 @@ services:
       MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017}
     ports:
       # Only reachable from this machine, like Mongo.
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${BACKEND_PORT:-3000}:3000"
     depends_on:
       mongo:
         condition: service_healthy
@@ -65,7 +65,7 @@ services:
       BACKEND_URL: http://backend:3000
     ports:
       # Only reachable from this machine, like the backend.
-      - "127.0.0.1:3001:3001"
+      - "127.0.0.1:${FRONTEND_PORT:-3001}:3001"
     depends_on:
       - backend
     logging:
