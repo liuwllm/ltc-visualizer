@@ -57,5 +57,22 @@ services:
         max-size: 10m
         max-file: "3"
 
+  frontend:
+    build: ./frontend
+    container_name: ltc-frontend
+    restart: unless-stopped
+    environment:
+      BACKEND_URL: http://backend:3000
+    ports:
+      # Only reachable from this machine, like the backend.
+      - "127.0.0.1:3001:3001"
+    depends_on:
+      - backend
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
 volumes:
   mongo-data:
