@@ -183,3 +183,7 @@ export function filterRoute(snapshots, routeId) {
   const route = normRoute(routeId);
   return snapshots.map((s) => ({ ...s, vehicles: s.vehicles.filter((v) => normRoute(v.routeId) === route) }));
 }
+
+// Route ids seen in the snapshots (without leading zeros), in numeric order.
+export const routeIds = (snapshots) =>
+  [...new Set(allVehicles(snapshots).map((v) => normRoute(v.routeId)))].sort((a, b) => a - b || a.localeCompare(b));

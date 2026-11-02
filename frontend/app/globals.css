@@ -97,8 +97,67 @@ a {
   gap: 16px;
 }
 
-.grid-loading {
+.muted {
   color: var(--muted);
+}
+
+.crumb {
+  color: var(--primary);
+}
+
+.crumb:hover {
+  text-decoration: underline;
+}
+
+.card-link {
+  margin-left: auto;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  color: var(--primary);
+  font-size: 20px;
+}
+
+.card-link:hover {
+  background: var(--primary-tint);
+}
+
+/* Per-route sort controls */
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 28px 0 16px;
+}
+
+.toolbar h2 {
+  font-size: 17px;
+  font-weight: 600;
+  margin-right: auto;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 13px;
+}
+
+.pill:hover {
+  border-color: var(--primary);
+}
+
+.pill.active {
+  background: var(--secondary);
+  border-color: var(--secondary);
+  color: #fff;
 }
 
 .card {
