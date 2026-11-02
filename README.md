@@ -62,6 +62,24 @@ month** at the default intervals. VehiclePositions is also polled because TripUp
 location or speed, which you need for average speed and bunching. Set
 `STORE_VEHICLE_POSITIONS=0` to skip it.
 
+## Backend metrics
+
+`GET /metrics/<metric>` covers all routes; `GET /metrics/<metric>/<route>`
+covers one route (`2` and `02` both match). By default the metrics come from
+the latest snapshot. Add `?from=<ISO date>&to=<ISO date>` to pool every
+snapshot in that range. Snapshots are decoded in `backend/metrics.js`, since
+Mongo can't aggregate the protobuf fields.
+
+| metric | returns |
+|--------|---------|
+| `speed` | `avgSpeedKmh` over vehicles that report a speed (~60%) |
+| `deviation` | `avgDelaySec` (+ = late) and `avgAbsDelaySec`; departure delay, falling back to arrival; unknown delays skipped |
+| `punctuality` | `earlyPct` / `onTimePct` / `latePct`; on time = 1 min early to 5 min late |
+| `vehicles` | `active` and `bunched`, averaged per snapshot. Bunched = within 250 m (straight line) of another bus on the same route and direction, both past their first stop |
+
+Bunching takes direction and first stop from the static GTFS, falling back to
+the realtime `direction_id` when the trip isn't found there.
+
 ## Polling and retries
 
 - **Each feed is polled independently**: TripUpdates, VehiclePositions and
